@@ -27,6 +27,10 @@
 !/go.mod
 !/go.sum
 
+# allow: the public COSE_Sign1 reader subpackage
+!/cose/
+!/cose/**
+
 # allow: configuration and build files in the top-level dir
 !/.golangci.yml
 
