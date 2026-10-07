@@ -731,6 +731,33 @@ func (btm BignumTagMode) valid() bool {
 	return btm >= 0 && btm < maxBignumTag
 }
 
+// BignumTagFloatMode specifies how to decode the content of CBOR bignum tags 2 and 3
+// (RFC 8949 Section 3.4.3) into Go floating-point values.
+type BignumTagFloatMode int
+
+const (
+	// BignumTagFloatConvert allows bignum tag content to be decoded into Go
+	// floating-point values, silently rounding to the nearest representable value
+	// if the integer cannot be represented exactly. This is the default behavior.
+	BignumTagFloatConvert BignumTagFloatMode = iota
+
+	// BignumTagFloatExactOrError forbids bignum tag content from being implicitly
+	// decoded into a Go floating-point value it cannot be exactly represented by,
+	// preventing silent precision loss. If the integer value fits the destination
+	// float type exactly, it is decoded as usual. Otherwise Unmarshal returns an
+	// *UnmarshalTypeError reporting the bignum tag number and the destination
+	// Go type. This option doesn't affect decoding into values of type any,
+	// which continue to decode bignum tag content to big.Int or *big.Int
+	// (see BigIntDecMode).
+	BignumTagFloatExactOrError
+
+	maxBignumTagFloat
+)
+
+func (btfm BignumTagFloatMode) valid() bool {
+	return btfm >= 0 && btfm < maxBignumTagFloat
+}
+
 // BinaryUnmarshalerMode specifies how to decode into types that implement
 // encoding.BinaryUnmarshaler.
 type BinaryUnmarshalerMode int
@@ -899,6 +926,10 @@ type DecOptions struct {
 	// CBOR input, independent of the type of the destination value of a particular Unmarshal
 	// operation.
 	BignumTag BignumTagMode
+
+	// BignumTagFloat specifies how to decode the content of CBOR bignum tags 2 and 3
+	// (RFC 8949 Section 3.4.3) into Go floating-point values.
+	BignumTagFloat BignumTagFloatMode
 
 	// BinaryUnmarshaler specifies how to decode into types that implement
 	// encoding.BinaryUnmarshaler.
@@ -1120,6 +1151,10 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		return nil, errors.New("cbor: invalid BignumTag " + strconv.Itoa(int(opts.BignumTag)))
 	}
 
+	if !opts.BignumTagFloat.valid() {
+		return nil, errors.New("cbor: invalid BignumTagFloat " + strconv.Itoa(int(opts.BignumTagFloat)))
+	}
+
 	if !opts.BinaryUnmarshaler.valid() {
 		return nil, errors.New("cbor: invalid BinaryUnmarshaler " + strconv.Itoa(int(opts.BinaryUnmarshaler)))
 	}
@@ -1154,6 +1189,7 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		byteStringToTime:          opts.ByteStringToTime,
 		byteStringExpectedFormat:  opts.ByteStringExpectedFormat,
 		bignumTag:                 opts.BignumTag,
+		bignumTagFloat:            opts.BignumTagFloat,
 		binaryUnmarshaler:         opts.BinaryUnmarshaler,
 		textUnmarshaler:           opts.TextUnmarshaler,
 		jsonUnmarshalerTranscoder: opts.JSONUnmarshalerTranscoder,
@@ -1235,6 +1271,7 @@ type decMode struct {
 	byteStringToTime          ByteStringToTimeMode
 	byteStringExpectedFormat  ByteStringExpectedFormatMode
 	bignumTag                 BignumTagMode
+	bignumTagFloat            BignumTagFloatMode
 	binaryUnmarshaler         BinaryUnmarshalerMode
 	textUnmarshaler           TextUnmarshalerMode
 	jsonUnmarshalerTranscoder Transcoder
@@ -1277,6 +1314,7 @@ func (dm *decMode) DecOptions() DecOptions {
 		ByteStringToTime:          dm.byteStringToTime,
 		ByteStringExpectedFormat:  dm.byteStringExpectedFormat,
 		BignumTag:                 dm.bignumTag,
+		BignumTagFloat:            dm.bignumTagFloat,
 		BinaryUnmarshaler:         dm.binaryUnmarshaler,
 		TextUnmarshaler:           dm.textUnmarshaler,
 		JSONUnmarshalerTranscoder: dm.jsonUnmarshalerTranscoder,
@@ -1651,6 +1689,9 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 				return fillByteString(t, b, !copied, v, tInfo, ByteStringToStringForbidden, d.dm.binaryUnmarshaler, d.dm.textUnmarshaler)
 			}
 			if bi.IsUint64() {
+				if err := d.checkBignumTagFloatExact(tagNum, bi, tInfo); err != nil {
+					return err
+				}
 				return fillPositiveInt(t, bi.Uint64(), v)
 			}
 			return &UnmarshalTypeError{
@@ -1674,6 +1715,9 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 				return fillByteString(t, b, !copied, v, tInfo, ByteStringToStringForbidden, d.dm.binaryUnmarshaler, d.dm.textUnmarshaler)
 			}
 			if bi.IsInt64() {
+				if err := d.checkBignumTagFloatExact(tagNum, bi, tInfo); err != nil {
+					return err
+				}
 				return fillNegativeInt(t, bi.Int64(), v)
 			}
 			return &UnmarshalTypeError{
@@ -3143,6 +3187,36 @@ func fillNil(_ cborType, v reflect.Value) error {
 		return nil
 	}
 	return nil
+}
+
+// checkBignumTagFloatExact returns an *UnmarshalTypeError if the decoding mode forbids
+// bignum tag content from being implicitly decoded into a floating-point value that
+// cannot represent it exactly. It returns nil for non-float destination types and for
+// integer values that fit the destination float type exactly.
+func (d *decoder) checkBignumTagFloatExact(tagNum uint64, bi *big.Int, tInfo *typeInfo) error {
+	if d.dm.bignumTagFloat != BignumTagFloatExactOrError {
+		return nil
+	}
+	kind := tInfo.nonPtrKind
+	if kind != reflect.Float32 && kind != reflect.Float64 {
+		return nil
+	}
+	f := new(big.Float).SetInt(bi)
+	var acc big.Accuracy
+	if kind == reflect.Float32 {
+		_, acc = f.Float32()
+	} else {
+		_, acc = f.Float64()
+	}
+	if acc == big.Exact {
+		return nil
+	}
+	return &UnmarshalTypeError{
+		CBORType: cborTypeTag.String(),
+		GoType:   tInfo.nonPtrType.String(),
+		errorMsg: "cbor bignum (tag " + strconv.FormatUint(tagNum, 10) + ") " + bi.String() +
+			" cannot be represented exactly as " + tInfo.nonPtrType.String(),
+	}
 }
 
 func fillPositiveInt(t cborType, val uint64, v reflect.Value) error {

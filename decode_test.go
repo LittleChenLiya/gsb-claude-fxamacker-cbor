@@ -6086,6 +6086,7 @@ func TestDecOptions(t *testing.T) {
 		ByteStringToTime:          ByteStringToTimeAllowed,
 		ByteStringExpectedFormat:  ByteStringExpectedBase64URL,
 		BignumTag:                 BignumTagForbidden,
+		BignumTagFloat:            BignumTagFloatExactOrError,
 		BinaryUnmarshaler:         BinaryUnmarshalerNone,
 		TextUnmarshaler:           TextUnmarshalerTextString,
 		JSONUnmarshalerTranscoder: stubTranscoder{},
@@ -11388,6 +11389,207 @@ func TestBignumTagMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecModeInvalidBignumTagFloat(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		opts         DecOptions
+		wantErrorMsg string
+	}{
+		{
+			name:         "below range of valid modes",
+			opts:         DecOptions{BignumTagFloat: -1},
+			wantErrorMsg: "cbor: invalid BignumTagFloat -1",
+		},
+		{
+			name:         "above range of valid modes",
+			opts:         DecOptions{BignumTagFloat: 101},
+			wantErrorMsg: "cbor: invalid BignumTagFloat 101",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.opts.DecMode()
+			if err == nil {
+				t.Errorf("DecMode() didn't return an error")
+			} else if err.Error() != tc.wantErrorMsg {
+				t.Errorf("DecMode() returned error %q, want %q", err.Error(), tc.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestBignumTagFloatMode(t *testing.T) {
+	// Tiny encodings of positive and negative integers around 2^64 (and int64/uint64 limits).
+	cborDataPosBignumMaxUint64 := mustHexDecode("c248ffffffffffffffff")     // 2(18446744073709551615), not exactly representable as float32/float64
+	cborDataPosBignumExact := mustHexDecode("c248fffffffffffff800")         // 2(18446744073709549568), exactly representable as float64
+	cborDataPosBignum2To63 := mustHexDecode("c2488000000000000000")         // 2(9223372036854775808), exactly representable as float32/float64
+	cborDataPosBignum2To64Plus1 := mustHexDecode("c249010000000000000001")  // 2(18446744073709551617), overflows uint64
+	cborDataNegBignumMinInt64Plus1 := mustHexDecode("c3487ffffffffffffffe") // 3(-9223372036854775807), not exactly representable as float32/float64
+	cborDataNegBignumMinInt64 := mustHexDecode("c3487fffffffffffffff")      // 3(-9223372036854775808), exactly representable as float32/float64
+	cborDataNegBignumNeg2To64Minus1 := mustHexDecode("c349010000000000000000") // 3(-18446744073709551617), overflows int64
+	cborDataSmallBignum := mustHexDecode("c2412a")                          // 2(42)
+	cborDataSmallPosInt := mustHexDecode("182a")                            // 42
+	cborDataSmallNegInt := mustHexDecode("3829")                            // -42
+
+	dm, err := DecOptions{BignumTagFloat: BignumTagFloatExactOrError}.DecMode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dm.DecOptions().BignumTagFloat; got != BignumTagFloatExactOrError {
+		t.Fatalf("DecOptions().BignumTagFloat = %v, want %v", got, BignumTagFloatExactOrError)
+	}
+
+	t.Run("rejects bignum tag content not exactly representable by float target", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			data         []byte
+			dstType      reflect.Type
+			wantErrorMsg string
+		}{
+			{
+				name:         "positive bignum 2^64-1 to float64",
+				data:         cborDataPosBignumMaxUint64,
+				dstType:      typeFloat64,
+				wantErrorMsg: "cbor: cannot unmarshal tag into Go value of type float64 (cbor bignum (tag 2) 18446744073709551615 cannot be represented exactly as float64)",
+			},
+			{
+				name:         "positive bignum 2^64-1 to float32",
+				data:         cborDataPosBignumMaxUint64,
+				dstType:      typeFloat32,
+				wantErrorMsg: "cbor: cannot unmarshal tag into Go value of type float32 (cbor bignum (tag 2) 18446744073709551615 cannot be represented exactly as float32)",
+			},
+			{
+				name:         "negative bignum math.MinInt64+1 to float64",
+				data:         cborDataNegBignumMinInt64Plus1,
+				dstType:      typeFloat64,
+				wantErrorMsg: "cbor: cannot unmarshal tag into Go value of type float64 (cbor bignum (tag 3) -9223372036854775807 cannot be represented exactly as float64)",
+			},
+			{
+				name:         "negative bignum math.MinInt64+1 to float32",
+				data:         cborDataNegBignumMinInt64Plus1,
+				dstType:      typeFloat32,
+				wantErrorMsg: "cbor: cannot unmarshal tag into Go value of type float32 (cbor bignum (tag 3) -9223372036854775807 cannot be represented exactly as float32)",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				dstv := reflect.New(tc.dstType)
+				err := unmarshalWithDM(t, dm, tc.data, dstv.Interface())
+				if err == nil {
+					t.Fatalf("Unmarshal(0x%x) didn't return an error", tc.data)
+				}
+				var ute *UnmarshalTypeError
+				if !errors.As(err, &ute) {
+					t.Fatalf("Unmarshal(0x%x) returned error %v (%T), want *UnmarshalTypeError", tc.data, err, err)
+				}
+				if err.Error() != tc.wantErrorMsg {
+					t.Errorf("Unmarshal(0x%x) returned error %q, want %q", tc.data, err.Error(), tc.wantErrorMsg)
+				}
+			})
+		}
+	})
+
+	t.Run("decodes exactly representable integers to float targets", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			data []byte
+			want float64
+		}{
+			{"positive bignum 2^64-2048", cborDataPosBignumExact, 18446744073709549568},
+			{"positive bignum 2^63", cborDataPosBignum2To63, 9223372036854775808},
+			{"negative bignum math.MinInt64", cborDataNegBignumMinInt64, -9223372036854775808},
+			{"small positive bignum", cborDataSmallBignum, 42},
+			{"small positive int", cborDataSmallPosInt, 42},
+			{"small negative int", cborDataSmallNegInt, -42},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var f float64
+				if err := unmarshalWithDM(t, dm, tc.data, &f); err != nil {
+					t.Fatalf("Unmarshal(0x%x) returned error %v", tc.data, err)
+				}
+				if f != tc.want {
+					t.Errorf("Unmarshal(0x%x) = %v, want %v", tc.data, f, tc.want)
+				}
+			})
+		}
+
+		t.Run("positive bignum 2^63 to float32", func(t *testing.T) {
+			var f float32
+			if err := unmarshalWithDM(t, dm, cborDataPosBignum2To63, &f); err != nil {
+				t.Fatalf("Unmarshal(0x%x) returned error %v", cborDataPosBignum2To63, err)
+			}
+			if want := float32(9223372036854775808); f != want {
+				t.Errorf("Unmarshal(0x%x) = %v, want %v", cborDataPosBignum2To63, f, want)
+			}
+		})
+	})
+
+	t.Run("big.Int target round-trips bignums near 2^64", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			data []byte
+			want string
+		}{
+			{"positive bignum 2^64+1", cborDataPosBignum2To64Plus1, "18446744073709551617"},
+			{"negative bignum -2^64-1", cborDataNegBignumNeg2To64Minus1, "-18446744073709551617"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				want, _ := new(big.Int).SetString(tc.want, 10)
+
+				var v big.Int
+				if err := unmarshalWithDM(t, dm, tc.data, &v); err != nil {
+					t.Fatalf("Unmarshal(0x%x) returned error %v", tc.data, err)
+				}
+				if v.Cmp(want) != 0 {
+					t.Fatalf("Unmarshal(0x%x) = %v, want %v", tc.data, &v, want)
+				}
+
+				encoded, err := Marshal(v)
+				if err != nil {
+					t.Fatalf("Marshal(%v) returned error %v", &v, err)
+				}
+				if !bytes.Equal(encoded, tc.data) {
+					t.Errorf("Marshal(%v) = 0x%x, want 0x%x", &v, encoded, tc.data)
+				}
+			})
+		}
+	})
+
+	t.Run("interface target decodes bignum to big.Int", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			data []byte
+			want string
+		}{
+			{"positive bignum 2^64+1", cborDataPosBignum2To64Plus1, "18446744073709551617"},
+			{"negative bignum -2^64-1", cborDataNegBignumNeg2To64Minus1, "-18446744073709551617"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var v any
+				if err := unmarshalWithDM(t, dm, tc.data, &v); err != nil {
+					t.Fatalf("Unmarshal(0x%x) returned error %v", tc.data, err)
+				}
+				bi, ok := v.(big.Int)
+				if !ok {
+					t.Fatalf("Unmarshal(0x%x) = %v (%T), want big.Int", tc.data, v, v)
+				}
+				if bi.String() != tc.want {
+					t.Errorf("Unmarshal(0x%x) = %v, want %v", tc.data, bi.String(), tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("default mode still converts inexact bignum to float target", func(t *testing.T) {
+		var f float64
+		if err := unmarshal(t, cborDataPosBignumMaxUint64, &f); err != nil {
+			t.Fatalf("Unmarshal(0x%x) returned error %v", cborDataPosBignumMaxUint64, err)
+		}
+		// 18446744073709551615 (2^64-1) is silently rounded to 2^64 by default.
+		if want := 1.8446744073709552e19; f != want {
+			t.Errorf("Unmarshal(0x%x) = %v, want %v", cborDataPosBignumMaxUint64, f, want)
+		}
+	})
 }
 
 func TestDecModeInvalidTextUnmarshaler(t *testing.T) {
