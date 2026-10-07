@@ -6086,6 +6086,7 @@ func TestDecOptions(t *testing.T) {
 		ByteStringToTime:          ByteStringToTimeAllowed,
 		ByteStringExpectedFormat:  ByteStringExpectedBase64URL,
 		BignumTag:                 BignumTagForbidden,
+		BignumTagToFloat:          BignumTagToFloatExactOnly,
 		BinaryUnmarshaler:         BinaryUnmarshalerNone,
 		TextUnmarshaler:           TextUnmarshalerTextString,
 		JSONUnmarshalerTranscoder: stubTranscoder{},
@@ -11388,6 +11389,377 @@ func TestBignumTagMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDecModeInvalidBignumTagToFloat(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		opts         DecOptions
+		wantErrorMsg string
+	}{
+		{
+			name:         "below range of valid modes",
+			opts:         DecOptions{BignumTagToFloat: -1},
+			wantErrorMsg: "cbor: invalid BignumTagToFloat -1",
+		},
+		{
+			name:         "above range of valid modes",
+			opts:         DecOptions{BignumTagToFloat: 101},
+			wantErrorMsg: "cbor: invalid BignumTagToFloat 101",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.opts.DecMode()
+			if err == nil {
+				t.Errorf("Expected non nil error from DecMode()")
+			} else if err.Error() != tc.wantErrorMsg {
+				t.Errorf("Expected error: %q, want: %q \n", tc.wantErrorMsg, err.Error())
+			}
+		})
+	}
+}
+
+// TestBignumTagToFloatExactOnly verifies the BignumTagToFloatExactOnly decoding option
+// with micro-encoded bignums around 2^64: bignum tags that would lose precision are
+// rejected for float destinations, big.Int destinations round-trip losslessly, exact
+// bignum values (small integers and powers of two) are still assigned to float, and
+// regular (untagged) small integers remain compatible.
+func TestBignumTagToFloatExactOnly(t *testing.T) {
+	exactOnlyDM, err := DecOptions{BignumTagToFloat: BignumTagToFloatExactOnly}.DecMode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultDM, err := DecOptions{}.DecMode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Micro encodings: positive/negative integers around the 2^64 boundary.
+	// Bignum tags are mandatory for the negative boundary because untagged CBOR
+	// integers (major type 1) can't express values below math.MinInt64.
+	var (
+		// tag 2, content h'8000000000000000' (8 bytes): unsigned 2^63, exact in float64.
+		uExact = mustHexDecode("c2488000000000000000")
+		// tag 2, content h'8000000000000001' (8 bytes): unsigned 2^63 + 1, fits uint64
+		// but loses precision in float64 (rounds to 2^63).
+		uLossy = mustHexDecode("c2488000000000000001")
+		// tag 2, content h'ffffffffffffffff' (8 bytes): unsigned 2^64 - 1, fits uint64
+		// but loses precision in float64 (rounds to 2^64).
+		uMax = mustHexDecode("c248ffffffffffffffff")
+		// tag 2, content h'010000000000000000' (9 bytes): unsigned 2^64,
+		// exact power of two representable by float64, but overflows uint64.
+		uPow2_64 = mustHexDecode("c249010000000000000000")
+		// tag 3, content h'7fffffffffffffff' (8 bytes): -(2^63 - 1) = math.MinInt64 + 1,
+		// fits int64 and is exact in float64.
+		nExact = mustHexDecode("c3487fffffffffffffff")
+		// tag 3, content h'8000000000000000' (8 bytes): -(2^63) - 1 = math.MinInt64 - 1,
+		// below int64 range and not exact in float64 (rounds to -2^63).
+		nLossy = mustHexDecode("c3488000000000000000")
+		// tag 3, content h'ffffffffffffffff' (8 bytes): -2^64,
+		// exact power of two representable by float64, but below int64 range.
+		nPow2_64 = mustHexDecode("c348ffffffffffffffff")
+		// tag 3, content h'010000000000000001' (9 bytes): -(2^64) - 2,
+		// below int64 range and not exact in float64.
+		nBelowPow2_64 = mustHexDecode("c349010000000000000001")
+		smallPos      = mustHexDecode("c2450100000000") // tag 2,  2^32 (exact in float32/float64)
+		smallNeg      = mustHexDecode("c344ffffffff")   // tag 3, -2^32 = -4294967296 (exact in float32/float64)
+		posNotF32     = mustHexDecode("c2450100000100") // tag 2,  2^32 + 256 (exact in float64, not float32)
+		plain42       = mustHexDecode("182a")           // untagged CBOR integer 42
+	)
+
+	// 2^1024 overflows both float32 and float64 (encoded with the library to avoid a
+	// 17-byte hand-written literal).
+	encEM, err := EncOptions{}.EncMode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugePow2BI := new(big.Int).Lsh(big.NewInt(1), 1024)
+	hugePow2 := func() []byte {
+		data, err := encEM.Marshal(hugePow2BI)
+		if err != nil {
+			panic(err)
+		}
+		return data
+	}()
+
+	for _, tc := range []struct {
+		name     string
+		dm       DecMode
+		input    []byte
+		decode   func() (any, error)
+		wantVal  any    // expected decoded value (nil when wantErr is set)
+		wantErr  string // exact expected error message ("" means success)
+		wantTag  int    // expected BignumTagToFloatError.TagNum
+		wantType string // expected BignumTagToFloatError.GoType
+	}{
+		{
+			name:    "2^64-1 unsigned bignum rejected for float64 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   uMax,
+			decode:  func() (any, error) { var f float64; return f, unmarshalWithDM(t, exactOnlyDM, uMax, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 2 into Go value of type float64 (18446744073709551615 cannot be represented without precision loss)",
+			wantTag: 2, wantType: "float64",
+		},
+		{
+			name:    "2^64-1 unsigned bignum rejected for float32 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   uMax,
+			decode:  func() (any, error) { var f float32; return f, unmarshalWithDM(t, exactOnlyDM, uMax, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 2 into Go value of type float32 (18446744073709551615 cannot be represented without precision loss)",
+			wantTag: 2, wantType: "float32",
+		},
+		{
+			name:    "2^63+1 unsigned bignum rejected for float64 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   uLossy,
+			decode:  func() (any, error) { var f float64; return f, unmarshalWithDM(t, exactOnlyDM, uLossy, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 2 into Go value of type float64 (9223372036854775809 cannot be represented without precision loss)",
+			wantTag: 2, wantType: "float64",
+		},
+		{
+			name:    "-(2^63)-1 negative bignum rejected for float64 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   nLossy,
+			decode:  func() (any, error) { var f float64; return f, unmarshalWithDM(t, exactOnlyDM, nLossy, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 3 into Go value of type float64 (-9223372036854775809 cannot be represented without precision loss)",
+			wantTag: 3, wantType: "float64",
+		},
+		{
+			name:    "-(2^63)-1 negative bignum rejected for float32 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   nLossy,
+			decode:  func() (any, error) { var f float32; return f, unmarshalWithDM(t, exactOnlyDM, nLossy, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 3 into Go value of type float32 (-9223372036854775809 cannot be represented without precision loss)",
+			wantTag: 3, wantType: "float32",
+		},
+		{
+			name:    "default mode still decodes 2^64-1 bignum to rounded float64",
+			dm:      defaultDM,
+			input:   uMax,
+			decode:  func() (any, error) { var f float64; err := unmarshalWithDM(t, defaultDM, uMax, &f); return f, err },
+			wantVal: float64(18446744073709551616), // 2^64: nearest float64 to 2^64-1
+		},
+		{
+			name:    "default mode rejects below-int64 negative bignum into float64",
+			dm:      defaultDM,
+			input:   nLossy,
+			decode:  func() (any, error) { var f float64; return f, unmarshalWithDM(t, defaultDM, nLossy, &f) },
+			wantErr: "cbor: cannot unmarshal tag into Go value of type float64 (-9223372036854775809 overflows float64)",
+			wantTag: 0, wantType: "", // not a BignumTagToFloatError in the default mode
+		},
+		{
+			name:    "2^63 unsigned bignum accepted for float64 under ExactOnly (power of two)",
+			dm:      exactOnlyDM,
+			input:   uExact,
+			decode:  func() (any, error) { var f float64; err := unmarshalWithDM(t, exactOnlyDM, uExact, &f); return f, err },
+			wantVal: float64(9223372036854775808), // 2^63
+		},
+		{
+			name:  "2^64 accepted for float64 under ExactOnly (power of two beyond uint64)",
+			dm:    exactOnlyDM,
+			input: uPow2_64,
+			decode: func() (any, error) {
+				var f float64
+				err := unmarshalWithDM(t, exactOnlyDM, uPow2_64, &f)
+				return f, err
+			},
+			wantVal: float64(18446744073709551616), // 2^64
+		},
+		{
+			name:  "-2^64 accepted for float64 under ExactOnly (power of two below int64)",
+			dm:    exactOnlyDM,
+			input: nPow2_64,
+			decode: func() (any, error) {
+				var f float64
+				err := unmarshalWithDM(t, exactOnlyDM, nPow2_64, &f)
+				return f, err
+			},
+			wantVal: -float64(18446744073709551616), // -2^64
+		},
+		{
+			name:    "-(2^63-1) negative bignum accepted for float64 under ExactOnly (exact)",
+			dm:      exactOnlyDM,
+			input:   nExact,
+			decode:  func() (any, error) { var f float64; err := unmarshalWithDM(t, exactOnlyDM, nExact, &f); return f, err },
+			wantVal: float64(-9223372036854775807),
+		},
+		{
+			name:  "small exact tagged positive bignum compatible with float32 under ExactOnly",
+			dm:    exactOnlyDM,
+			input: smallPos,
+			decode: func() (any, error) {
+				var f float32
+				err := unmarshalWithDM(t, exactOnlyDM, smallPos, &f)
+				return f, err
+			},
+			wantVal: float32(4294967296), // 2^32
+		},
+		{
+			name:  "small exact tagged negative bignum compatible with float64 under ExactOnly",
+			dm:    exactOnlyDM,
+			input: smallNeg,
+			decode: func() (any, error) {
+				var f float64
+				err := unmarshalWithDM(t, exactOnlyDM, smallNeg, &f)
+				return f, err
+			},
+			wantVal: -float64(4294967296),
+		},
+		{
+			name:  "2^32+256 accepted for float64 but rejected for float32 under ExactOnly (float64)",
+			dm:    exactOnlyDM,
+			input: posNotF32,
+			decode: func() (any, error) {
+				var f64v float64
+				err := unmarshalWithDM(t, exactOnlyDM, posNotF32, &f64v)
+				return f64v, err
+			},
+			wantVal: float64(4294967552), // 2^32 + 256
+		},
+		{
+			name:    "2^32+256 rejected for float32 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   posNotF32,
+			decode:  func() (any, error) { var f float32; return f, unmarshalWithDM(t, exactOnlyDM, posNotF32, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 2 into Go value of type float32 (4294967552 cannot be represented without precision loss)",
+			wantTag: 2, wantType: "float32",
+		},
+		{
+			name:    "2^1024 rejected for float64 under ExactOnly (out of finite range)",
+			dm:      exactOnlyDM,
+			input:   hugePow2,
+			decode:  func() (any, error) { var f float64; return f, unmarshalWithDM(t, exactOnlyDM, hugePow2, &f) },
+			wantErr: "cbor: cannot unmarshal bignum tag 2 into Go value of type float64 (" + hugePow2BI.String() + " cannot be represented without precision loss)",
+			wantTag: 2, wantType: "float64",
+		},
+		{
+			name:    "regular untagged small integer still compatible with float64 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   plain42,
+			decode:  func() (any, error) { var f float64; err := unmarshalWithDM(t, exactOnlyDM, plain42, &f); return f, err },
+			wantVal: float64(42),
+		},
+		{
+			name:    "regular untagged small integer still compatible with float32 under ExactOnly",
+			dm:      exactOnlyDM,
+			input:   plain42,
+			decode:  func() (any, error) { var f float32; err := unmarshalWithDM(t, exactOnlyDM, plain42, &f); return f, err },
+			wantVal: float32(42),
+		},
+		{
+			name:    "integer destination unaffected by ExactOnly",
+			dm:      exactOnlyDM,
+			input:   uLossy,
+			decode:  func() (any, error) { var i uint64; err := unmarshalWithDM(t, exactOnlyDM, uLossy, &i); return i, err },
+			wantVal: uint64(9223372036854775809),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.decode()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("got nil error, want %q", tc.wantErr)
+				}
+				if err.Error() != tc.wantErr {
+					t.Errorf("error = %q, want %q", err.Error(), tc.wantErr)
+				}
+				if tc.wantTag == 0 {
+					return // error expected, but not a BignumTagToFloatError
+				}
+				var bte *BignumTagToFloatError
+				if !errors.As(err, &bte) {
+					t.Fatalf("error type %T, want *BignumTagToFloatError", err)
+				}
+				if bte.TagNum != tc.wantTag {
+					t.Errorf("TagNum = %d, want %d", bte.TagNum, tc.wantTag)
+				}
+				if bte.GoType != tc.wantType {
+					t.Errorf("GoType = %q, want %q", bte.GoType, tc.wantType)
+				}
+				if bte.Value == nil {
+					t.Errorf("Value is nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("got unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.wantVal) {
+				t.Errorf("decoded value = %v (%T), want %v (%T)", got, got, tc.wantVal, tc.wantVal)
+			}
+		})
+	}
+
+	// big.Int destinations round-trip near-2^64 bignums regardless of the float gate.
+	for _, tc := range []struct {
+		name  string
+		input []byte
+		want  big.Int
+	}{
+		{"unsigned 2^64-1 (tag 2, 8 bytes)", uMax, mustBigInt("18446744073709551615")},
+		{"unsigned 2^64 (tag 2, 9 bytes)", uPow2_64, mustBigInt("18446744073709551616")},
+		{"negative -(2^63)-1 (tag 3, 8 bytes)", nLossy, mustBigInt("-9223372036854775809")},
+		{"negative -2^64 (tag 3, 8 bytes)", nPow2_64, mustBigInt("-18446744073709551616")},
+	} {
+		t.Run("big.Int roundtrip "+tc.name, func(t *testing.T) {
+			var bi big.Int
+			if err := unmarshalWithDM(t, exactOnlyDM, tc.input, &bi); err != nil {
+				t.Fatalf("Unmarshal() returned error %v", err)
+			}
+			if bi.Cmp(&tc.want) != 0 {
+				t.Errorf("decoded big.Int = %s, want %s", bi.String(), tc.want.String())
+			}
+			// Re-encode the decoded big.Int and decode it again (encoder may shorten
+			// values that fit untagged CBOR integers, so only compare values).
+			data, err := encEM.Marshal(&bi)
+			if err != nil {
+				t.Fatalf("Marshal() returned error %v", err)
+			}
+			var bi2 big.Int
+			if err := unmarshalWithDM(t, exactOnlyDM, data, &bi2); err != nil {
+				t.Fatalf("round-trip Unmarshal() returned error %v", err)
+			}
+			if bi2.Cmp(&tc.want) != 0 {
+				t.Errorf("round-trip big.Int = %s, want %s", bi2.String(), tc.want.String())
+			}
+		})
+	}
+
+	// big.Int re-encoding is byte-identical to the tag 2/tag 3 micro encodings when
+	// the bignum value can't fit an untagged CBOR integer.
+	for _, tc := range []struct {
+		name  string
+		input []byte
+		want  big.Int
+	}{
+		{"unsigned 2^64", uPow2_64, mustBigInt("18446744073709551616")},
+		{"negative -2^64-2 (tag 3, 9 bytes)", nBelowPow2_64, mustBigInt("-18446744073709551618")},
+	} {
+		t.Run("big.Int re-encode byte-identical "+tc.name, func(t *testing.T) {
+			data, err := encEM.Marshal(tc.want)
+			if err != nil {
+				t.Fatalf("Marshal() returned error %v", err)
+			}
+			if !bytes.Equal(data, tc.input) {
+				t.Errorf("Marshal(big.Int) = 0x%x, want 0x%x", data, tc.input)
+			}
+		})
+	}
+
+	// Interface destinations keep decoding bignums to big.Int under ExactOnly.
+	t.Run("interface destination keeps big.Int", func(t *testing.T) {
+		var v any
+		if err := unmarshalWithDM(t, exactOnlyDM, uMax, &v); err != nil {
+			t.Fatalf("Unmarshal() returned error %v", err)
+		}
+		bi, ok := v.(big.Int)
+		if !ok {
+			t.Fatalf("decoded type %T, want big.Int", v)
+		}
+		if want := mustBigInt("18446744073709551615"); bi.Cmp(&want) != 0 {
+			t.Errorf("decoded big.Int = %s, want %s", bi.String(), want.String())
+		}
+	})
 }
 
 func TestDecModeInvalidTextUnmarshaler(t *testing.T) {

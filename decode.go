@@ -226,6 +226,36 @@ func (e UnacceptableDataItemError) Error() string {
 	return fmt.Sprintf("cbor: data item of cbor type %s is not accepted by protocol: %s", e.CBORType, e.Message)
 }
 
+// BignumTagToFloatError is returned when unmarshaling a CBOR bignum (tag 2 or tag 3)
+// into a floating-point Go value fails because the bignum can't be represented by the
+// floating-point type without losing precision. It is only returned when decoding with
+// BignumTagToFloatExactOnly.
+type BignumTagToFloatError struct {
+	// TagNum is the CBOR bignum tag number (2 for unsigned bignum or 3 for negative bignum).
+	TagNum int
+	// GoType is the Go floating-point type of the destination value.
+	GoType string
+	// Value is the bignum value that cannot be represented exactly.
+	Value *big.Int
+}
+
+func newBignumTagToFloatError(tagNum int, goType string, v *big.Int) *BignumTagToFloatError {
+	return &BignumTagToFloatError{
+		TagNum: tagNum,
+		GoType: goType,
+		Value:  new(big.Int).Set(v),
+	}
+}
+
+func (e *BignumTagToFloatError) Error() string {
+	return fmt.Sprintf(
+		"cbor: cannot unmarshal bignum tag %d into Go value of type %s (%s cannot be represented without precision loss)",
+		e.TagNum,
+		e.GoType,
+		e.Value.String(),
+	)
+}
+
 // ByteStringExpectedFormatError is returned when unmarshaling CBOR byte string fails when
 // using non-default ByteStringExpectedFormat decoding option that makes decoder expect
 // a specified format such as base64, hex, etc.
@@ -731,6 +761,31 @@ func (btm BignumTagMode) valid() bool {
 	return btm >= 0 && btm < maxBignumTag
 }
 
+// BignumTagToFloatMode specifies whether a CBOR bignum (tag 2 or tag 3) can be
+// implicitly decoded into a floating-point Go value (float32 or float64). It only
+// affects bignum tags decoded into typed floating-point destinations; decoding a
+// bignum into an interface value always yields a big.Int.
+type BignumTagToFloatMode int
+
+const (
+	// BignumTagToFloatAllowed allows bignum tags to be decoded into a floating-point
+	// value, even when the conversion loses precision (e.g. a bignum value near 2^64
+	// rounded to fit float64). This is the default behavior.
+	BignumTagToFloatAllowed BignumTagToFloatMode = iota
+
+	// BignumTagToFloatExactOnly only allows a bignum tag to be decoded into a
+	// floating-point value when the bignum is exactly representable by the destination
+	// floating-point type (including within the finite range of the destination type).
+	// If the bignum can't be represented exactly, a BignumTagToFloatError is returned.
+	BignumTagToFloatExactOnly
+
+	maxBignumTagToFloatMode
+)
+
+func (btfm BignumTagToFloatMode) valid() bool {
+	return btfm >= 0 && btfm < maxBignumTagToFloatMode
+}
+
 // BinaryUnmarshalerMode specifies how to decode into types that implement
 // encoding.BinaryUnmarshaler.
 type BinaryUnmarshalerMode int
@@ -899,6 +954,18 @@ type DecOptions struct {
 	// CBOR input, independent of the type of the destination value of a particular Unmarshal
 	// operation.
 	BignumTag BignumTagMode
+
+	// BignumTagToFloat specifies whether a bignum tag (tag 2 or tag 3) can be implicitly
+	// decoded into a floating-point destination (float32 or float64). By default, the
+	// conversion is allowed and may silently lose precision (e.g. a bignum value near 2^64
+	// is rounded to fit float64). Set it to BignumTagToFloatExactOnly to reject bignum tags
+	// that can't be represented exactly by the destination floating-point type; decoding
+	// then returns a *BignumTagToFloatError reporting the bignum tag number and the Go
+	// destination type. Bignum values that are exactly representable (such as small
+	// integers or powers of two) are still decoded to the floating-point value. This
+	// option doesn't affect decoding into big.Int (the interface destination also keeps
+	// decoding bignums to big.Int).
+	BignumTagToFloat BignumTagToFloatMode
 
 	// BinaryUnmarshaler specifies how to decode into types that implement
 	// encoding.BinaryUnmarshaler.
@@ -1120,6 +1187,10 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		return nil, errors.New("cbor: invalid BignumTag " + strconv.Itoa(int(opts.BignumTag)))
 	}
 
+	if !opts.BignumTagToFloat.valid() {
+		return nil, errors.New("cbor: invalid BignumTagToFloat " + strconv.Itoa(int(opts.BignumTagToFloat)))
+	}
+
 	if !opts.BinaryUnmarshaler.valid() {
 		return nil, errors.New("cbor: invalid BinaryUnmarshaler " + strconv.Itoa(int(opts.BinaryUnmarshaler)))
 	}
@@ -1154,6 +1225,7 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		byteStringToTime:          opts.ByteStringToTime,
 		byteStringExpectedFormat:  opts.ByteStringExpectedFormat,
 		bignumTag:                 opts.BignumTag,
+		bignumTagToFloat:          opts.BignumTagToFloat,
 		binaryUnmarshaler:         opts.BinaryUnmarshaler,
 		textUnmarshaler:           opts.TextUnmarshaler,
 		jsonUnmarshalerTranscoder: opts.JSONUnmarshalerTranscoder,
@@ -1235,6 +1307,7 @@ type decMode struct {
 	byteStringToTime          ByteStringToTimeMode
 	byteStringExpectedFormat  ByteStringExpectedFormatMode
 	bignumTag                 BignumTagMode
+	bignumTagToFloat          BignumTagToFloatMode
 	binaryUnmarshaler         BinaryUnmarshalerMode
 	textUnmarshaler           TextUnmarshalerMode
 	jsonUnmarshalerTranscoder Transcoder
@@ -1277,6 +1350,7 @@ func (dm *decMode) DecOptions() DecOptions {
 		ByteStringToTime:          dm.byteStringToTime,
 		ByteStringExpectedFormat:  dm.byteStringExpectedFormat,
 		BignumTag:                 dm.bignumTag,
+		BignumTagToFloat:          dm.bignumTagToFloat,
 		BinaryUnmarshaler:         dm.binaryUnmarshaler,
 		TextUnmarshaler:           dm.textUnmarshaler,
 		JSONUnmarshalerTranscoder: dm.jsonUnmarshalerTranscoder,
@@ -1650,6 +1724,13 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 			if tInfo.nonPtrKind == reflect.Slice || tInfo.nonPtrKind == reflect.Array {
 				return fillByteString(t, b, !copied, v, tInfo, ByteStringToStringForbidden, d.dm.binaryUnmarshaler, d.dm.textUnmarshaler)
 			}
+			if d.dm.bignumTagToFloat == BignumTagToFloatExactOnly &&
+				(tInfo.nonPtrKind == reflect.Float32 || tInfo.nonPtrKind == reflect.Float64) {
+				if f, ok := bignumToExactFloat(bi, tInfo.nonPtrKind); ok {
+					return fillFloat(t, f, v)
+				}
+				return newBignumTagToFloatError(tagNumUnsignedBignum, tInfo.nonPtrType.String(), bi)
+			}
 			if bi.IsUint64() {
 				return fillPositiveInt(t, bi.Uint64(), v)
 			}
@@ -1672,6 +1753,13 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 			}
 			if tInfo.nonPtrKind == reflect.Slice || tInfo.nonPtrKind == reflect.Array {
 				return fillByteString(t, b, !copied, v, tInfo, ByteStringToStringForbidden, d.dm.binaryUnmarshaler, d.dm.textUnmarshaler)
+			}
+			if d.dm.bignumTagToFloat == BignumTagToFloatExactOnly &&
+				(tInfo.nonPtrKind == reflect.Float32 || tInfo.nonPtrKind == reflect.Float64) {
+				if f, ok := bignumToExactFloat(bi, tInfo.nonPtrKind); ok {
+					return fillFloat(t, f, v)
+				}
+				return newBignumTagToFloatError(tagNumNegativeBignum, tInfo.nonPtrType.String(), bi)
 			}
 			if bi.IsInt64() {
 				return fillNegativeInt(t, bi.Int64(), v)
@@ -3238,6 +3326,26 @@ func fillFloat(t cborType, val float64, v reflect.Value) error {
 		return nil
 	}
 	return &UnmarshalTypeError{CBORType: t.String(), GoType: v.Type().String()}
+}
+
+// bignumToExactFloat converts bignum bi to the floating-point value of the given kind
+// (reflect.Float32 or reflect.Float64). The boolean result is true only when bi is
+// exactly representable by the destination floating-point type; a bignum outside the
+// finite range of the destination type (which would convert to +/-Inf) is rejected.
+func bignumToExactFloat(bi *big.Int, kind reflect.Kind) (float64, bool) {
+	// Convert bi at the destination type's mantissa precision (53 bits for float64,
+	// 24 bits for float32). big.Exact means no bits were dropped during the
+	// conversion, i.e. bi is exactly representable by the destination type.
+	precision := uint(53)
+	if kind == reflect.Float32 {
+		precision = 24
+	}
+	bf := new(big.Float).SetPrec(precision).SetMode(big.ToNearestEven).SetInt(bi)
+	f, _ := bf.Float64()
+	if bf.Acc() != big.Exact || math.IsInf(f, 0) {
+		return f, false
+	}
+	return f, true
 }
 
 func fillByteString(t cborType, val []byte, shared bool, v reflect.Value, tInfo *typeInfo, bsts ByteStringToStringMode, bum BinaryUnmarshalerMode, tum TextUnmarshalerMode) error {
