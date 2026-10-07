@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -357,6 +358,33 @@ const (
 
 func (tm TagsMode) valid() bool {
 	return tm >= 0 && tm < maxTagsMode
+}
+
+// NestedTagWhitelistMode specifies whether the decoder enforces a whitelist
+// of allowed tag numbers on every nested CBOR tag (major type 6) it decodes,
+// instead of only inspecting the outermost tag.
+type NestedTagWhitelistMode int
+
+const (
+	// NestedTagWhitelistDisabled (default) makes decoder not enforce a tag
+	// whitelist on nested tags. Tag handling is unchanged.
+	NestedTagWhitelistDisabled NestedTagWhitelistMode = iota
+
+	// NestedTagWhitelistEnforced makes decoder check the tag number of every
+	// nested CBOR tag against a whitelist before decoding the tag content.
+	// The whitelist consists of the built-in recognized tag numbers (0, 1, 2,
+	// 3, and 55799) and every tag number registered in the DecMode's TagSet.
+	// If a tag number is not whitelisted, decoding stops with a
+	// *TagWhitelistError (which records the rejected tag number and the
+	// container path), and registered decoders (e.g. UnmarshalCBOR) for the
+	// rejected tag content are not invoked.
+	NestedTagWhitelistEnforced
+
+	maxNestedTagWhitelistMode
+)
+
+func (ntwm NestedTagWhitelistMode) valid() bool {
+	return ntwm >= 0 && ntwm < maxNestedTagWhitelistMode
 }
 
 // IntDecMode specifies which Go type (int64, uint64, or big.Int) should
@@ -912,6 +940,16 @@ type DecOptions struct {
 	// implement json.Unmarshaler but do not also implement cbor.Unmarshaler. If nil, decoding
 	// behavior is not influenced by whether or not a type implements json.Unmarshaler.
 	JSONUnmarshalerTranscoder Transcoder
+
+	// NestedTagWhitelist specifies whether the decoder enforces a whitelist of
+	// allowed tag numbers on every nested CBOR tag (major type 6) it decodes,
+	// rather than only handling the outermost tag. The whitelist consists of
+	// the built-in recognized tag numbers (0, 1, 2, 3, and 55799) and every
+	// tag number registered in the DecMode's TagSet. Decoding of a
+	// non-whitelisted tag fails with a *TagWhitelistError before any
+	// registered decoder for the tag content is invoked. The default
+	// (NestedTagWhitelistDisabled) leaves tag handling unchanged.
+	NestedTagWhitelist NestedTagWhitelistMode
 }
 
 // DecMode returns DecMode with immutable options and no tags (safe for concurrency).
@@ -1128,6 +1166,10 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		return nil, errors.New("cbor: invalid TextUnmarshaler " + strconv.Itoa(int(opts.TextUnmarshaler)))
 	}
 
+	if !opts.NestedTagWhitelist.valid() {
+		return nil, errors.New("cbor: invalid NestedTagWhitelist " + strconv.Itoa(int(opts.NestedTagWhitelist)))
+	}
+
 	dm := decMode{
 		dupMapKey:                 opts.DupMapKey,
 		timeTag:                   opts.TimeTag,
@@ -1157,6 +1199,7 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		binaryUnmarshaler:         opts.BinaryUnmarshaler,
 		textUnmarshaler:           opts.TextUnmarshaler,
 		jsonUnmarshalerTranscoder: opts.JSONUnmarshalerTranscoder,
+		nestedTagWhitelist:        opts.NestedTagWhitelist,
 	}
 
 	return &dm, nil
@@ -1238,6 +1281,7 @@ type decMode struct {
 	binaryUnmarshaler         BinaryUnmarshalerMode
 	textUnmarshaler           TextUnmarshalerMode
 	jsonUnmarshalerTranscoder Transcoder
+	nestedTagWhitelist        NestedTagWhitelistMode
 }
 
 var defaultDecMode, _ = DecOptions{}.decMode()
@@ -1280,6 +1324,7 @@ func (dm *decMode) DecOptions() DecOptions {
 		BinaryUnmarshaler:         dm.binaryUnmarshaler,
 		TextUnmarshaler:           dm.textUnmarshaler,
 		JSONUnmarshalerTranscoder: dm.jsonUnmarshalerTranscoder,
+		NestedTagWhitelist:        dm.nestedTagWhitelist,
 	}
 }
 
@@ -1378,6 +1423,102 @@ type decoder struct {
 	// encoding of the byte strings h'42' and h'43' would be controlled by tag 23 and 21,
 	// respectively.
 	expectedLaterEncodingTags []uint64
+
+	// containerPath stores the path of nested containers (array indices and map
+	// keys/struct field names) enclosing the data item currently being decoded.
+	// It is only maintained when the nested tag whitelist is enforced, and is
+	// used to report the location of a rejected tag in TagWhitelistError.
+	containerPath []any
+}
+
+// pushContainerPath appends a container path segment. It is a no-op unless the
+// nested tag whitelist is enforced.
+func (d *decoder) pushContainerPath(seg any) {
+	if d.dm.nestedTagWhitelist != NestedTagWhitelistEnforced {
+		return
+	}
+	d.containerPath = append(d.containerPath, seg)
+}
+
+// popContainerPath removes the innermost container path segment. It is a no-op
+// unless the nested tag whitelist is enforced.
+func (d *decoder) popContainerPath() {
+	if d.dm.nestedTagWhitelist != NestedTagWhitelistEnforced {
+		return
+	}
+	d.containerPath = d.containerPath[:len(d.containerPath)-1]
+}
+
+// containerPathString returns a string representation of the current container
+// path, e.g. "$", "$[0]", `$[0]["key"]`.
+func (d *decoder) containerPathString() string {
+	var sb strings.Builder
+	sb.WriteByte('$')
+	for _, seg := range d.containerPath {
+		switch s := seg.(type) {
+		case int:
+			sb.WriteByte('[')
+			sb.WriteString(strconv.Itoa(s))
+			sb.WriteByte(']')
+		case string:
+			sb.WriteByte('[')
+			sb.WriteString(strconv.Quote(s))
+			sb.WriteByte(']')
+		}
+	}
+	return sb.String()
+}
+
+// mapKeyPathSegment converts a decoded map key to a container path segment.
+func mapKeyPathSegment(k any) any {
+	if s, ok := k.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", k)
+}
+
+// checkNestedTagWhitelist verifies the tag numbers of all consecutive tags
+// enclosing the next data item against the nested tag whitelist. It is a no-op
+// unless the nested tag whitelist is enforced. On rejection, the rejected data
+// item is skipped and a *TagWhitelistError (recording the rejected tag number
+// and the container path) is returned before any registered decoder for the
+// tag content is invoked.
+func (d *decoder) checkNestedTagWhitelist() error {
+	if d.dm.nestedTagWhitelist != NestedTagWhitelistEnforced {
+		return nil
+	}
+	off := d.off
+	for d.nextCBORType() == cborTypeTag {
+		_, _, tagNum := d.readHead()
+		if !d.dm.tagNumWhitelisted(tagNum) {
+			err := &TagWhitelistError{TagNum: tagNum, Path: d.containerPathString()}
+			d.off = off
+			d.skip() // Skip the rejected data item.
+			return err
+		}
+	}
+	d.off = off
+	return nil
+}
+
+// tagNumWhitelisted reports whether tagNum is allowed by the nested tag
+// whitelist: built-in recognized tag numbers (0, 1, 2, 3, and 55799) and tag
+// numbers registered in the TagSet are allowed.
+func (dm *decMode) tagNumWhitelisted(tagNum uint64) bool {
+	switch tagNum {
+	case tagNumRFC3339Time, tagNumEpochTime, tagNumUnsignedBignum, tagNumNegativeBignum, tagNumSelfDescribedCBOR:
+		return true
+	}
+	switch tags := dm.tags.(type) {
+	case tagSet:
+		return tags.hasTagNum(tagNum)
+	case *syncTagSet:
+		tags.RLock()
+		ok := tags.t.hasTagNum(tagNum)
+		tags.RUnlock()
+		return ok
+	}
+	return false
 }
 
 // value decodes CBOR data item into the value pointed to by v.
@@ -1485,6 +1626,11 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 		}
 	}
 	d.off = off
+
+	// Check nested tags against the tag whitelist (no-op unless enforced).
+	if err := d.checkNestedTagWhitelist(); err != nil {
+		return err
+	}
 
 	if tInfo.spclType != specialTypeNone {
 		switch tInfo.spclType {
@@ -1963,6 +2109,11 @@ func (d *decoder) parse(skipSelfDescribedTag bool) (any, error) { //nolint:gocyc
 	}
 	d.off = off
 
+	// Check nested tags against the tag whitelist (no-op unless enforced).
+	if err := d.checkNestedTagWhitelist(); err != nil {
+		return nil, err
+	}
+
 	t := d.nextCBORType()
 	switch t {
 	case cborTypePositiveInt:
@@ -2401,7 +2552,10 @@ func (d *decoder) parseArray() ([]any, error) {
 	var e any
 	var err, lastErr error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
-		if e, lastErr = d.parse(true); lastErr != nil {
+		d.pushContainerPath(i)
+		e, lastErr = d.parse(true)
+		d.popContainerPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2425,7 +2579,10 @@ func (d *decoder) parseArrayToSlice(v reflect.Value, tInfo *typeInfo) error {
 	v.SetLen(count)
 	var err error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
-		if lastErr := d.parseToValue(v.Index(i), tInfo.elemTypeInfo); lastErr != nil {
+		d.pushContainerPath(i)
+		lastErr := d.parseToValue(v.Index(i), tInfo.elemTypeInfo)
+		d.popContainerPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2444,7 +2601,10 @@ func (d *decoder) parseArrayToArray(v reflect.Value, tInfo *typeInfo) error {
 	for ci := 0; (hasSize && ci < count) || (!hasSize && !d.foundBreak()); ci++ {
 		if gi < vLen {
 			// Read CBOR array element and set array element
-			if lastErr := d.parseToValue(v.Index(gi), tInfo.elemTypeInfo); lastErr != nil {
+			d.pushContainerPath(gi)
+			lastErr := d.parseToValue(v.Index(gi), tInfo.elemTypeInfo)
+			d.popContainerPath()
+			if lastErr != nil {
 				if err == nil {
 					err = lastErr
 				}
@@ -2498,7 +2658,10 @@ func (d *decoder) parseMap() (any, error) {
 		}
 
 		// Parse CBOR map value.
-		if e, lastErr = d.parse(true); lastErr != nil {
+		d.pushContainerPath(mapKeyPathSegment(k))
+		e, lastErr = d.parse(true)
+		d.popContainerPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2615,7 +2778,10 @@ func (d *decoder) parseMapToMap(v reflect.Value, tInfo *typeInfo) error { //noli
 		} else if !reuseEle {
 			eleValue.SetZero()
 		}
-		if lastErr := d.parseToValue(eleValue, tInfo.elemTypeInfo); lastErr != nil {
+		d.pushContainerPath(mapKeyPathSegment(keyValue.Interface()))
+		lastErr = d.parseToValue(eleValue, tInfo.elemTypeInfo)
+		d.popContainerPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2773,7 +2939,9 @@ func (d *decoder) decodeToStructField(v reflect.Value, f *decodingField, tInfo *
 		}
 	}
 
+	d.pushContainerPath(f.name)
 	err := d.parseToValue(fv, f.typInfo)
+	d.popContainerPath()
 	if err != nil {
 		if typeError, ok := err.(*UnmarshalTypeError); ok {
 			typeError.StructFieldName = tInfo.nonPtrType.String() + "." + f.name

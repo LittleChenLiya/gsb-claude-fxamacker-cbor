@@ -6089,6 +6089,7 @@ func TestDecOptions(t *testing.T) {
 		BinaryUnmarshaler:         BinaryUnmarshalerNone,
 		TextUnmarshaler:           TextUnmarshalerTextString,
 		JSONUnmarshalerTranscoder: stubTranscoder{},
+		NestedTagWhitelist:        NestedTagWhitelistEnforced,
 	}
 	ov := reflect.ValueOf(opts1)
 	for i := range ov.NumField() {

@@ -207,6 +207,19 @@ func (t tagSet) getTypeFromTagNum(num []uint64) reflect.Type {
 	return nil
 }
 
+// hasTagNum reports whether num appears in any registered tag item's tag
+// number sequence.
+func (t tagSet) hasTagNum(num uint64) bool {
+	for _, tag := range t {
+		for _, n := range tag.num {
+			if n == num {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // NewTagSet returns TagSet (safe for concurrency).
 func NewTagSet() TagSet {
 	return &syncTagSet{t: make(map[reflect.Type]*tagItem)}
@@ -325,4 +338,20 @@ type WrongTagError struct {
 
 func (e *WrongTagError) Error() string {
 	return fmt.Sprintf("cbor: wrong tag number for %s, got %v, expected %v", e.RegisteredType.String(), e.TagNum, e.RegisteredTagNum)
+}
+
+// TagWhitelistError describes a CBOR tag rejected by the nested tag whitelist
+// (see DecOptions.NestedTagWhitelist). It records the rejected tag number and
+// the path of the container enclosing the rejected tag.
+type TagWhitelistError struct {
+	// TagNum is the tag number that is not in the whitelist.
+	TagNum uint64
+
+	// Path is the container path of the rejected tag, e.g. "$", "$[0]",
+	// `$[0]["key"]`.
+	Path string
+}
+
+func (e *TagWhitelistError) Error() string {
+	return fmt.Sprintf("cbor: tag number %d at %s is not allowed by the nested tag whitelist", e.TagNum, e.Path)
 }
