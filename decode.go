@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -817,6 +818,18 @@ type DecOptions struct {
 	// TagsMd specifies whether to allow CBOR tags (major type 6).
 	TagsMd TagsMode
 
+	// TagWhitelist, if non-nil, specifies the CBOR tag numbers (major type 6)
+	// allowed to appear in decoded data.  Every nested tag is checked against
+	// the whitelist as it is decoded (not just the outermost tag), and a
+	// registered tag content decoder is only invoked after its tag number is
+	// allowed.  Decoding fails with *TagNotAllowedError when a tag number is
+	// not in the whitelist; the error records the rejected tag number and the
+	// container path to it.  If nil (default), tag handling is unchanged.
+	//
+	// Note: the self-described CBOR tag (55799) is always allowed because it
+	// is ignored automatically during decoding.
+	TagWhitelist *TagWhitelist
+
 	// IntDec specifies which Go integer type (int64, uint64, or [big.Int]) to use
 	// when decoding CBOR int (major type 0 and 1) to a value of type any.
 	IntDec IntDecMode
@@ -1136,6 +1149,7 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		maxMapPairs:               opts.MaxMapPairs,
 		indefLength:               opts.IndefLength,
 		tagsMd:                    opts.TagsMd,
+		tagWhitelist:              opts.TagWhitelist,
 		intDec:                    opts.IntDec,
 		mapKeyByteString:          opts.MapKeyByteString,
 		extraReturnErrors:         opts.ExtraReturnErrors,
@@ -1217,6 +1231,7 @@ type decMode struct {
 	maxMapPairs               int
 	indefLength               IndefLengthMode
 	tagsMd                    TagsMode
+	tagWhitelist              *TagWhitelist
 	intDec                    IntDecMode
 	mapKeyByteString          MapKeyByteStringMode
 	extraReturnErrors         ExtraDecErrorCond
@@ -1259,6 +1274,7 @@ func (dm *decMode) DecOptions() DecOptions {
 		MaxMapPairs:               dm.maxMapPairs,
 		IndefLength:               dm.indefLength,
 		TagsMd:                    dm.tagsMd,
+		TagWhitelist:              dm.tagWhitelist,
 		IntDec:                    dm.intDec,
 		MapKeyByteString:          dm.mapKeyByteString,
 		ExtraReturnErrors:         dm.extraReturnErrors,
@@ -1378,6 +1394,54 @@ type decoder struct {
 	// encoding of the byte strings h'42' and h'43' would be controlled by tag 23 and 21,
 	// respectively.
 	expectedLaterEncodingTags []uint64
+
+	// tagPath stores the container path (array indexes, map keys, and struct
+	// field names) to the value currently being decoded.  It is only
+	// maintained when dm.tagWhitelist is non-nil, and is used to report the
+	// location of a rejected tag in TagNotAllowedError.
+	tagPath []any
+}
+
+// pushTagPath appends a container path segment.  It is a no-op unless the
+// decoding mode uses a tag whitelist.
+func (d *decoder) pushTagPath(seg any) {
+	if d.dm.tagWhitelist != nil {
+		d.tagPath = append(d.tagPath, seg)
+	}
+}
+
+// popTagPath removes the most recent container path segment.  It is a no-op
+// unless the decoding mode uses a tag whitelist.
+func (d *decoder) popTagPath() {
+	if d.dm.tagWhitelist != nil {
+		d.tagPath = d.tagPath[:len(d.tagPath)-1]
+	}
+}
+
+// tagPathString formats the container path to the value currently being decoded.
+func (d *decoder) tagPathString() string {
+	var sb strings.Builder
+	for _, seg := range d.tagPath {
+		switch s := seg.(type) {
+		case int:
+			fmt.Fprintf(&sb, "[%d]", s)
+		case string:
+			sb.WriteString(".")
+			sb.WriteString(s)
+		default:
+			fmt.Fprintf(&sb, "[%v]", s)
+		}
+	}
+	return sb.String()
+}
+
+// checkTagWhitelist returns a *TagNotAllowedError if the decoding mode uses
+// a tag whitelist and the given tag number is not allowed.
+func (d *decoder) checkTagWhitelist(tagNum uint64) error {
+	if d.dm.tagWhitelist != nil && !d.dm.tagWhitelist.allows(tagNum) {
+		return &TagNotAllowedError{TagNum: tagNum, Path: d.tagPathString()}
+	}
+	return nil
 }
 
 // value decodes CBOR data item into the value pointed to by v.
@@ -1479,6 +1543,10 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 	off := d.off
 	for d.nextCBORType() == cborTypeTag {
 		_, _, tagNum := d.readHead()
+		if err := d.checkTagWhitelist(tagNum); err != nil {
+			d.skip()
+			return err
+		}
 		if err := validBuiltinTag(tagNum, d.data[d.off]); err != nil {
 			d.skip()
 			return err
@@ -1956,6 +2024,10 @@ func (d *decoder) parse(skipSelfDescribedTag bool) (any, error) { //nolint:gocyc
 	off := d.off
 	for d.nextCBORType() == cborTypeTag {
 		_, _, tagNum := d.readHead()
+		if err := d.checkTagWhitelist(tagNum); err != nil {
+			d.skip()
+			return nil, err
+		}
 		if err := validBuiltinTag(tagNum, d.data[d.off]); err != nil {
 			d.skip()
 			return nil, err
@@ -2401,7 +2473,10 @@ func (d *decoder) parseArray() ([]any, error) {
 	var e any
 	var err, lastErr error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
-		if e, lastErr = d.parse(true); lastErr != nil {
+		d.pushTagPath(i)
+		e, lastErr = d.parse(true)
+		d.popTagPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2425,7 +2500,10 @@ func (d *decoder) parseArrayToSlice(v reflect.Value, tInfo *typeInfo) error {
 	v.SetLen(count)
 	var err error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
-		if lastErr := d.parseToValue(v.Index(i), tInfo.elemTypeInfo); lastErr != nil {
+		d.pushTagPath(i)
+		lastErr := d.parseToValue(v.Index(i), tInfo.elemTypeInfo)
+		d.popTagPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2444,7 +2522,10 @@ func (d *decoder) parseArrayToArray(v reflect.Value, tInfo *typeInfo) error {
 	for ci := 0; (hasSize && ci < count) || (!hasSize && !d.foundBreak()); ci++ {
 		if gi < vLen {
 			// Read CBOR array element and set array element
-			if lastErr := d.parseToValue(v.Index(gi), tInfo.elemTypeInfo); lastErr != nil {
+			d.pushTagPath(ci)
+			lastErr := d.parseToValue(v.Index(gi), tInfo.elemTypeInfo)
+			d.popTagPath()
+			if lastErr != nil {
 				if err == nil {
 					err = lastErr
 				}
@@ -2498,7 +2579,10 @@ func (d *decoder) parseMap() (any, error) {
 		}
 
 		// Parse CBOR map value.
-		if e, lastErr = d.parse(true); lastErr != nil {
+		d.pushTagPath(k)
+		e, lastErr = d.parse(true)
+		d.popTagPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2615,7 +2699,10 @@ func (d *decoder) parseMapToMap(v reflect.Value, tInfo *typeInfo) error { //noli
 		} else if !reuseEle {
 			eleValue.SetZero()
 		}
-		if lastErr := d.parseToValue(eleValue, tInfo.elemTypeInfo); lastErr != nil {
+		d.pushTagPath(keyValue.Interface())
+		lastErr = d.parseToValue(eleValue, tInfo.elemTypeInfo)
+		d.popTagPath()
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2708,7 +2795,10 @@ func (d *decoder) parseArrayToStruct(v reflect.Value, tInfo *typeInfo) error {
 			}
 		}
 
-		if lastErr = d.parseToValue(fv, f.typInfo); lastErr != nil {
+		d.pushTagPath(f.name)
+		lastErr = d.parseToValue(fv, f.typInfo)
+		d.popTagPath()
+		if lastErr != nil {
 			if err == nil {
 				if typeError, ok := lastErr.(*UnmarshalTypeError); ok {
 					typeError.StructFieldName = tInfo.typ.String() + "." + f.name
@@ -2773,7 +2863,9 @@ func (d *decoder) decodeToStructField(v reflect.Value, f *decodingField, tInfo *
 		}
 	}
 
+	d.pushTagPath(f.name)
 	err := d.parseToValue(fv, f.typInfo)
+	d.popTagPath()
 	if err != nil {
 		if typeError, ok := err.(*UnmarshalTypeError); ok {
 			typeError.StructFieldName = tInfo.nonPtrType.String() + "." + f.name

@@ -6068,6 +6068,7 @@ func TestDecOptions(t *testing.T) {
 		MaxMapPairs:               101,
 		IndefLength:               IndefLengthForbidden,
 		TagsMd:                    TagsForbidden,
+		TagWhitelist:              NewTagWhitelist(1000),
 		IntDec:                    IntDecConvertSigned,
 		MapKeyByteString:          MapKeyByteStringForbidden,
 		ExtraReturnErrors:         ExtraDecErrorUnknownField,

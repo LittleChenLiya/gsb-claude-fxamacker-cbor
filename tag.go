@@ -316,6 +316,51 @@ var (
 	typeRawTag = reflect.TypeFor[RawTag]()
 )
 
+// TagWhitelist specifies the set of CBOR tag numbers (major type 6) allowed
+// to appear in decoded data.  It is used by DecOptions.TagWhitelist to
+// reject data items containing tags that are not explicitly allowed.
+//
+// TagWhitelist is immutable once created and is safe for concurrent use.
+type TagWhitelist struct {
+	allowedTags map[uint64]struct{}
+}
+
+// NewTagWhitelist returns a TagWhitelist that allows the given tag numbers.
+// A TagWhitelist created with no tag numbers rejects all tags.
+func NewTagWhitelist(nums ...uint64) *TagWhitelist {
+	allowedTags := make(map[uint64]struct{}, len(nums))
+	for _, num := range nums {
+		allowedTags[num] = struct{}{}
+	}
+	return &TagWhitelist{allowedTags: allowedTags}
+}
+
+// allows reports whether the given tag number is allowed by the whitelist.
+func (tw *TagWhitelist) allows(num uint64) bool {
+	_, ok := tw.allowedTags[num]
+	return ok
+}
+
+// TagNotAllowedError describes a CBOR tag rejected by the decoding mode's
+// tag whitelist (see DecOptions.TagWhitelist).
+type TagNotAllowedError struct {
+	// TagNum is the CBOR tag number rejected by the tag whitelist.
+	TagNum uint64
+
+	// Path is the container path to the rejected tag within the decoded
+	// data item (e.g. "[0][1]" for a tag nested in two arrays, or ".name"
+	// for a tag in a struct field).  It is empty if the rejected tag is at
+	// the top level of the data item.
+	Path string
+}
+
+func (e *TagNotAllowedError) Error() string {
+	if e.Path == "" {
+		return fmt.Sprintf("cbor: tag number %d is not allowed by tag whitelist", e.TagNum)
+	}
+	return fmt.Sprintf("cbor: tag number %d is not allowed by tag whitelist at %s", e.TagNum, e.Path)
+}
+
 // WrongTagError describes mismatch between CBOR tag and registered tag.
 type WrongTagError struct {
 	RegisteredType   reflect.Type
